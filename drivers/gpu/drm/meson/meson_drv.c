@@ -41,13 +41,13 @@
 
 #include "meson_drv.h"
 #include "meson_plane.h"
+#include "meson_overlay.h"
 #include "meson_crtc.h"
 #include "meson_venc_cvbs.h"
 
 #include "meson_vpp.h"
 #include "meson_viu.h"
 #include "meson_venc.h"
-#include "meson_canvas.h"
 #include "meson_registers.h"
 
 #define DRIVER_NAME "meson"
@@ -216,25 +216,24 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 		goto free_drm;
 	}
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "dmc");
-	if (!res) {
-		ret = -EINVAL;
-		goto free_drm;
-	}
-	/* Simply ioremap since it may be a shared register zone */
-	regs = devm_ioremap(dev, res->start, resource_size(res));
-	if (!regs) {
-		ret = -EADDRNOTAVAIL;
+	priv->canvas = meson_canvas_get(dev);
+	if (IS_ERR(priv->canvas)) {
+		ret = PTR_ERR(priv->canvas);
 		goto free_drm;
 	}
 
-	priv->dmc = devm_regmap_init_mmio(dev, regs,
-					  &meson_regmap_config);
-	if (IS_ERR(priv->dmc)) {
-		dev_err(&pdev->dev, "Couldn't create the DMC regmap\n");
-		ret = PTR_ERR(priv->dmc);
+	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_osd1);
+	if (ret)
 		goto free_drm;
-	}
+	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_0);
+	if (ret)
+		goto free_drm;
+	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_1);
+	if (ret)
+		goto free_drm;
+	ret = meson_canvas_alloc(priv->canvas, &priv->canvas_id_vd1_2);
+	if (ret)
+		goto free_drm;
 
 	priv->vsync_irq = platform_get_irq(pdev, 0);
 
@@ -243,8 +242,8 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 		goto free_drm;
 
 	drm_mode_config_init(drm);
-	drm->mode_config.max_width = 3840;
-	drm->mode_config.max_height = 2160;
+	drm->mode_config.max_width = 16384;
+	drm->mode_config.max_height = 8192;
 	drm->mode_config.funcs = &meson_mode_config_funcs;
 
 	/* Hardware Initialization */
@@ -269,6 +268,10 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
 	}
 
 	ret = meson_plane_create(priv);
+	if (ret)
+		goto free_drm;
+
+	ret = meson_overlay_create(priv);
 	if (ret)
 		goto free_drm;
 
@@ -315,6 +318,7 @@ static void meson_drv_unbind(struct device *dev)
 	struct drm_device *drm = dev_get_drvdata(dev);
 	struct meson_drm *priv = drm->dev_private;
 
+	meson_canvas_free(priv->canvas, priv->canvas_id_osd1);
 	drm_dev_unregister(drm);
 	drm_kms_helper_poll_fini(drm);
 	drm_fbdev_cma_fini(priv->fbdev);
