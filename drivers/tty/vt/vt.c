@@ -302,6 +302,20 @@ static inline unsigned short *screenpos(struct vc_data *vc, int offset, int view
 	return p;
 }
 
+static inline unsigned short *screenpos_utf8(struct vc_data *vc, int offset, int viewed)
+{
+	unsigned short *p;
+
+	if (!viewed)
+		p = (unsigned short *)(vc->vc_origin + offset + vc->vc_screenbuf_size);
+	else if (!vc->vc_sw->con_screen_pos)
+		p = (unsigned short *)(vc->vc_visible_origin + offset + vc->vc_screenbuf_size);
+	else
+		p = vc->vc_sw->con_screen_pos(vc, -offset - 1);
+	return p;
+}
+ 
+
 /* Called  from the keyboard irq path.. */
 static inline void scrolldelta(int lines)
 {
@@ -338,6 +352,10 @@ static void con_scroll(struct vc_data *vc, unsigned int t, unsigned int b,
 	}
 	scr_memmovew(d, s, (b - t - nr) * vc->vc_size_row);
 	scr_memsetw(clear, vc->vc_video_erase_char, vc->vc_size_row * nr);
+	d += (vc->vc_screenbuf_size >> 1);
+	s += (vc->vc_screenbuf_size >> 1);
+	scr_memmovew(d, s, (b - t - nr) * vc->vc_size_row);
+	scr_memsetw(clear, 0, vc->vc_size_row * nr);
 }
 
 static void do_update_region(struct vc_data *vc, unsigned long start, int count)
@@ -499,6 +517,8 @@ void complement_pos(struct vc_data *vc, int offset)
 	static int old_offset = -1;
 	static unsigned short old;
 	static unsigned short oldx, oldy;
+	static unsigned short *p_ext = NULL;
+	static unsigned short old_ext = 0;
 
 	WARN_CONSOLE_UNLOCKED();
 
@@ -506,7 +526,7 @@ void complement_pos(struct vc_data *vc, int offset)
 	    old_offset < vc->vc_screenbuf_size) {
 		scr_writew(old, screenpos(vc, old_offset, 1));
 		if (con_should_update(vc))
-			vc->vc_sw->con_putc(vc, old, oldy, oldx);
+			vc->vc_sw->con_putc(vc, (old_ext << 16)|old, oldy, oldx);
 		notify_update(vc);
 	}
 
@@ -517,13 +537,15 @@ void complement_pos(struct vc_data *vc, int offset)
 		unsigned short new;
 		unsigned short *p;
 		p = screenpos(vc, offset, 1);
+		p_ext = screenpos_utf8(vc, offset, 1);
 		old = scr_readw(p);
+		old_ext = scr_readw(p_ext);
 		new = old ^ vc->vc_complement_mask;
 		scr_writew(new, p);
 		if (con_should_update(vc)) {
 			oldx = (offset >> 1) % vc->vc_cols;
 			oldy = (offset >> 1) / vc->vc_cols;
-			vc->vc_sw->con_putc(vc, new, oldy, oldx);
+			vc->vc_sw->con_putc(vc, (old_ext << 16)|new, oldy, oldx);
 		}
 		notify_update(vc);
 	}
@@ -784,7 +806,7 @@ int vc_allocate(unsigned int currcons)	/* return 0 on success */
 	if (!*vc->vc_uni_pagedir_loc)
 		con_set_default_unimap(vc);
 
-	vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_KERNEL);
+	vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size * 2, GFP_KERNEL);
 	if (!vc->vc_screenbuf)
 		goto err_free;
 
@@ -846,7 +868,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
 	unsigned long old_origin, new_origin, new_scr_end, rlth, rrem, err = 0;
 	unsigned long end;
 	unsigned int old_rows, old_row_size;
-	unsigned int new_cols, new_rows, new_row_size, new_screen_size;
+	unsigned int new_cols, new_rows, new_row_size, new_screen_size, old_screen_size;
 	unsigned int user;
 	unsigned short *newscreen;
 
@@ -871,7 +893,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
 
 	if (new_screen_size > (4 << 20))
 		return -EINVAL;
-	newscreen = kzalloc(new_screen_size, GFP_USER);
+	newscreen = kzalloc(new_screen_size * 2, GFP_USER);
 	if (!newscreen)
 		return -ENOMEM;
 
@@ -880,6 +902,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
 
 	old_rows = vc->vc_rows;
 	old_row_size = vc->vc_size_row;
+	old_screen_size = old_row_size * old_rows;
 
 	err = resize_screen(vc, new_cols, new_rows, user);
 	if (err) {
@@ -921,15 +944,23 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
 	while (old_origin < end) {
 		scr_memcpyw((unsigned short *) new_origin,
 			    (unsigned short *) old_origin, rlth);
-		if (rrem)
+ 		scr_memcpyw((unsigned short *) new_origin + (new_screen_size >> 1),
+ 			    (unsigned short *) old_origin + (old_screen_size >> 1), rlth);
+		if (rrem){
 			scr_memsetw((void *)(new_origin + rlth),
 				    vc->vc_video_erase_char, rrem);
+ 			scr_memsetw((void *)(new_origin + rlth + (new_screen_size)),
+ 				    vc->vc_video_erase_char, rrem);
+		}
 		old_origin += old_row_size;
 		new_origin += new_row_size;
 	}
-	if (new_scr_end > new_origin)
+	if (new_scr_end > new_origin){
 		scr_memsetw((void *)new_origin, vc->vc_video_erase_char,
 			    new_scr_end - new_origin);
+ 		scr_memsetw((void *)new_origin + (new_screen_size), vc->vc_video_erase_char,
+ 			    new_scr_end - new_origin);
+	}
 	kfree(vc->vc_screenbuf);
 	vc->vc_screenbuf = newscreen;
 	vc->vc_screenbuf_size = new_screen_size;
@@ -2188,7 +2219,7 @@ static void con_flush(struct vc_data *vc, unsigned long draw_from,
 /* acquires console_lock */
 static int do_con_write(struct tty_struct *tty, const unsigned char *buf, int count)
 {
-	int c, tc, ok, n = 0, draw_x = -1;
+	int c, tc, tc_1 , ok, n = 0, draw_x = -1;
 	unsigned int currcons;
 	unsigned long draw_from = 0, draw_to = 0;
 	struct vc_data *vc;
@@ -2198,6 +2229,7 @@ static int do_con_write(struct tty_struct *tty, const unsigned char *buf, int co
 	uint8_t inverse;
 	uint8_t width;
 	u16 himask, charmask;
+ 	int is_utf8 = 0;
 
 	if (in_interrupt())
 		return count;
@@ -2238,6 +2270,8 @@ static int do_con_write(struct tty_struct *tty, const unsigned char *buf, int co
 		rescan = 0;
 		inverse = 0;
 		width = 1;
+		vc->vc_utf = 1;
+		vc->vc_disp_ctrl = 0;
 
 		/* Do no translation at all in control states */
 		if (vc->vc_state != ESnormal) {
@@ -2279,6 +2313,7 @@ rescan_last_byte:
 			    vc->vc_utf_count = 0;
 			    c = 0xfffd;
 			} else if (c > 0x7f) {
+			    is_utf8 = 1;
 			    /* First byte of a multibyte sequence received */
 			    vc->vc_npar = 0;
 			    if ((c & 0xe0) == 0xc0) {
@@ -2304,8 +2339,9 @@ rescan_last_byte:
 				/* Still need some bytes */
 				continue;
 			    }
+			} else {
+				is_utf8 = 0;
 			}
-			/* Nothing to do if an ASCII byte was received */
 		    }
 		    /* End of UTF-8 decoding. */
 		    /* c is the received character, or U+FFFD for invalid sequences. */
@@ -2361,7 +2397,6 @@ rescan_last_byte:
 				    /* Display U+FFFD. If it's not found, display an inverse question mark. */
 				    tc = conv_uni_to_pc(vc, 0xfffd);
 				    if (tc < 0) {
-					inverse = 1;
 					tc = conv_uni_to_pc(vc, '?');
 					if (tc < 0) tc = '?';
 				    }
@@ -2383,40 +2418,131 @@ rescan_last_byte:
 			}
 
 			while (1) {
-				if (vc->vc_need_wrap || vc->vc_decim)
-					con_flush(vc, draw_from, draw_to,
-							&draw_x);
-				if (vc->vc_need_wrap) {
-					cr(vc);
-					lf(vc);
-				}
-				if (vc->vc_decim)
-					insert_char(vc, 1);
-				scr_writew(himask ?
-					     ((vc_attr << 8) & ~himask) + ((tc & 0x100) ? himask : 0) + (tc & 0xff) :
-					     (vc_attr << 8) + tc,
-					   (u16 *) vc->vc_pos);
-				if (con_should_update(vc) && draw_x < 0) {
-					draw_x = vc->vc_x;
-					draw_from = vc->vc_pos;
-				}
-				if (vc->vc_x == vc->vc_cols - 1) {
-					vc->vc_need_wrap = vc->vc_decawm;
-					draw_to = vc->vc_pos + 2;
-				} else {
-					vc->vc_x++;
-					draw_to = (vc->vc_pos += 2);
-				}
+				if(is_utf8 == 0) {
+					if (vc->vc_need_wrap || vc->vc_decim)
+						con_flush(vc, draw_from, draw_to,
+                                                       &draw_x);
+					if (vc->vc_need_wrap) {
+						cr(vc);
+						lf(vc);
+					}
+					if (vc->vc_decim)
+						insert_char(vc, 1);
+					scr_writew(himask ?
+						     ((vc_attr << 8) & ~himask) + ((tc & 0x100) ? himask : 0) + (tc & 0xff) :
+						     (vc_attr << 8) + tc,
+						   (u16 *) vc->vc_pos);
+					scr_writew(0, (u16 *) vc->vc_pos + (vc->vc_screenbuf_size >> 1));
+					if (con_should_update(vc) && draw_x < 0) {
+						draw_x = vc->vc_x;
+						draw_from = vc->vc_pos;
+					}
+					if (vc->vc_x == vc->vc_cols - 1) {
+						vc->vc_need_wrap = vc->vc_decawm;
+						draw_to = vc->vc_pos + 2;
+					} else {
+						vc->vc_x++;
+						draw_to = (vc->vc_pos += 2);
+					}
+
+					if (!--width) break;
+
+					tc = conv_uni_to_pc(vc, ' '); /* A space is printed in the second column */
+					if (tc < 0) tc = ' ';
+
+					notify_write(vc, c);
+
+					if (inverse) {
+						con_flush(vc, draw_from, draw_to,
+                                                       &draw_x);
+					}
 
 				if (!--width) break;
+				} else {
+					tc = 0xff;
+					tc_1 = 0xfe;
 
-				tc = conv_uni_to_pc(vc, ' '); /* A space is printed in the second column */
-				if (tc < 0) tc = ' ';
+					if (vc->vc_need_wrap || vc->vc_decim)
+						con_flush(vc, draw_from, draw_to,
+                                                       &draw_x);
+					if (vc->vc_need_wrap) {
+						cr(vc);
+						lf(vc);
+					}
+
+					if (vc->vc_decim)
+						insert_char(vc, 1);
+					scr_writew(himask ?
+						     ((vc_attr << 8) & ~himask) + ((tc & 0x100) ? himask : 0) + (tc & 0xff) :
+						     (vc_attr << 8) + tc,
+						   (u16 *) vc->vc_pos);
+					scr_writew(c,
+						   (u16 *) vc->vc_pos + (vc->vc_screenbuf_size >> 1));
+					if (con_should_update(vc) && draw_x < 0) {
+						draw_x = vc->vc_x;
+						draw_from = vc->vc_pos;
+					}
+					if (vc->vc_x == vc->vc_cols - 1) {
+						vc->vc_need_wrap = vc->vc_decawm;
+						draw_to = vc->vc_pos + 2;
+					} else {
+						vc->vc_x++;
+						draw_to = (vc->vc_pos += 2);
+					}
+
+					if (!--width) break;
+
+					tc = conv_uni_to_pc(vc, ' '); /* A space is printed in the second column */
+					if (tc < 0) tc = ' ';
+
+					notify_write(vc, c);
+
+					if (inverse) {
+						con_flush(vc, draw_from, draw_to,
+                                                       &draw_x);
+					}
+
+
+					if (vc->vc_need_wrap || vc->vc_decim)
+						con_flush(vc, draw_from, draw_to,
+                                                       &draw_x);
+					if (vc->vc_need_wrap) {
+						cr(vc);
+						lf(vc);
+					}
+
+					if (vc->vc_decim)
+						insert_char(vc, 1);
+					scr_writew(himask ?
+						     ((vc_attr << 8) & ~himask) + ((tc_1 & 0x100) ? himask : 0) + (tc_1 & 0xff) :
+						     (vc_attr << 8) + tc_1,
+						   (u16 *) vc->vc_pos);
+					scr_writew(c,
+						   (u16 *) vc->vc_pos + (vc->vc_screenbuf_size >> 1));
+					if (con_should_update(vc) && draw_x < 0) {
+						draw_x = vc->vc_x;
+						draw_from = vc->vc_pos;
+					}
+					if (vc->vc_x == vc->vc_cols - 1) {
+						vc->vc_need_wrap = vc->vc_decawm;
+						draw_to = vc->vc_pos + 2;
+					} else {
+						vc->vc_x++;
+						draw_to = (vc->vc_pos += 2);
+					}
+
+					if (!--width) break;
+
+					tc = conv_uni_to_pc(vc, ' '); /* A space is printed in the second column */
+					if (tc < 0) tc = ' ';
+
+					notify_write(vc, c);
+
+					if (inverse) {
+						con_flush(vc, draw_from, draw_to, &draw_x);
+					}
+				}
 			}
-			notify_write(vc, c);
-
-			if (inverse)
-				con_flush(vc, draw_from, draw_to, &draw_x);
 
 			if (rescan) {
 				rescan = 0;
@@ -3009,7 +3135,7 @@ static int __init con_init(void)
 		INIT_WORK(&vc_cons[currcons].SAK_work, vc_SAK);
 		tty_port_init(&vc->port);
 		visual_init(vc, currcons, 1);
-		vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_NOWAIT);
+		vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size * 2, GFP_NOWAIT);
 		vc_init(vc, vc->vc_rows, vc->vc_cols,
 			currcons || !vc->vc_sw->con_save_screen);
 	}
@@ -4251,9 +4377,15 @@ u16 screen_glyph(struct vc_data *vc, int offset)
 	u16 w = scr_readw(screenpos(vc, offset, 1));
 	u16 c = w & 0xff;
 
-	if (w & vc->vc_hi_font_mask)
-		c |= 0x100;
-	return c;
+	u16 c_utf8 = scr_readw(screenpos_utf8(vc, offset, 1));
+
+	if ( (c == 0xff || c == 0xfe) && c_utf8 != 0){
+		return c_utf8;
+	}else{
+		if (w & vc->vc_hi_font_mask)
+			c |= 0x100;
+		return c;
+	}
 }
 EXPORT_SYMBOL_GPL(screen_glyph);
 
